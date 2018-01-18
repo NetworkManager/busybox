@@ -99,6 +99,14 @@
 //config:	bool "Enable -N (dynamic switching of line numbers)"
 //config:	default y
 //config:	depends on FEATURE_LESS_DASHCMD
+//config:
+//config:config FEATURE_LESS_RAW
+//config:	bool "Enable -R (raw control characters)"
+//config:	default y
+//config:	depends on FEATURE_LESS_DASHCMD
+//config:	help
+//config:	This is essential for less applet to work with tools that use colors
+//config:	and paging, such as git, systemd tools or nmcli.
 
 //applet:IF_LESS(APPLET(less, BB_DIR_USR_BIN, BB_SUID_DROP))
 
@@ -106,7 +114,7 @@
 
 //usage:#define less_trivial_usage
 //usage:       "[-E" IF_FEATURE_LESS_REGEXP("I")IF_FEATURE_LESS_FLAGS("Mm")
-//usage:       "N" IF_FEATURE_LESS_TRUNCATE("S") "h~] [FILE]..."
+//usage:       "N" IF_FEATURE_LESS_TRUNCATE("S") IF_FEATURE_LESS_TRUNCATE("R") "h~] [FILE]..."
 //usage:#define less_full_usage "\n\n"
 //usage:       "View FILE (or stdin) one screenful at a time\n"
 //usage:     "\n	-E	Quit once the end of a file is reached"
@@ -120,6 +128,9 @@
 //usage:     "\n	-N	Prefix line number to each line"
 //usage:	IF_FEATURE_LESS_TRUNCATE(
 //usage:     "\n	-S	Truncate long lines"
+//usage:	)
+//usage:	IF_FEATURE_LESS_RAW(
+//usage:     "\n	-R	Don't escape control characters"
 //usage:	)
 //usage:     "\n	-~	Suppress ~s displayed past EOF"
 
@@ -140,6 +151,9 @@
 #define CLEAR       ESC"[H"ESC"[J"
 /* The escape code to clear to the end of line */
 #define CLEAR_2_EOL ESC"[K"
+/* Characters that are recognized as being a part of an ANSI escape sequence.
+ * Rather naive, good enough for recognizing color escapes though. */
+#define iscontrol(c) ((c) == '[' || isdigit(c) || (c) == ';')
 
 enum {
 /* Absolute max of lines eaten */
@@ -157,6 +171,7 @@ enum {
 	FLAG_TILDE = 1 << 4,
 	FLAG_I = 1 << 5,
 	FLAG_S = (1 << 6) * ENABLE_FEATURE_LESS_TRUNCATE,
+	FLAG_R = (1 << 7) * ENABLE_FEATURE_LESS_RAW,
 /* hijack command line options variable for internal state vars */
 	LESS_STATE_MATCH_BACKWARDS = 1 << 15,
 };
@@ -172,6 +187,9 @@ struct globals {
 	int less_gets_pos;
 /* last position in last line, taking into account tabs */
 	size_t last_line_pos;
+#ifdef ENABLE_FEATURE_LESS_RAW
+	int in_escape;
+#endif
 	unsigned max_fline;
 	unsigned max_lineno; /* this one tracks linewrap */
 	unsigned max_displayed_line;
@@ -219,6 +237,7 @@ struct globals {
 #define kbd_fd              (G.kbd_fd            )
 #define less_gets_pos       (G.less_gets_pos     )
 #define last_line_pos       (G.last_line_pos     )
+#define in_escape           (G.in_escape     )
 #define max_fline           (G.max_fline         )
 #define max_lineno          (G.max_lineno        )
 #define max_displayed_line  (G.max_displayed_line)
@@ -321,11 +340,13 @@ static void re_wrap(void)
 	int dst_idx;
 	int new_cur_fline = 0;
 	uint32_t lineno;
-	char linebuf[w + 1];
+	char *linebuf = NULL;
 	const char **old_flines = flines;
 	const char *s;
 	char **new_flines = NULL;
-	char *d;
+	int real_size = 0;
+	int real_len = 0;
+	int off = 0;
 
 	if (option_mask32 & FLAG_N)
 		w -= 8;
@@ -334,24 +355,44 @@ static void re_wrap(void)
 	dst_idx = 0;
 	s = old_flines[0];
 	lineno = LINENO(s);
-	d = linebuf;
+
 	new_line_pos = 0;
 	while (1) {
-		*d = *s;
-		if (*d != '\0') {
-			new_line_pos++;
-			if (*d == '\t') { /* tab */
+		if (real_size == real_len) {
+			real_size += w;
+			linebuf = xrealloc(linebuf, real_size + 1);
+		}
+
+		linebuf[off] = *s;
+		if (linebuf[off] != '\0') {
+
+#ifdef ENABLE_FEATURE_LESS_RAW
+            if (option_mask32 & FLAG_R && linebuf[off] == ESC[0]) {
+                in_escape = 1;
+            } else if (in_escape && !iscontrol(linebuf[off])) {
+                in_escape = 0;
+            } else if (!in_escape)
+#endif
+			{
+				new_line_pos++;
+			}
+
+			if (linebuf[off] == '\t') { /* tab */
 				new_line_pos += 7;
 				new_line_pos &= (~7);
 			}
 			s++;
-			d++;
+			off++;
+			real_len++;
+
 			if (new_line_pos >= w) {
 				int sz;
+				char *d;
+
 				/* new line is full, create next one */
-				*d = '\0';
+				linebuf[off] = '\0';
  next_new:
-				sz = (d - linebuf) + 1; /* + 1: NUL */
+				sz = real_len + 1; /* + 1: NUL */
 				d = ((char*)xmalloc(sz + 4)) + 4;
 				LINENO(d) = lineno;
 				memcpy(d, linebuf, sz);
@@ -364,12 +405,13 @@ static void re_wrap(void)
 						break;
 					lineno = LINENO(s);
 				}
-				d = linebuf;
+				off = 0;
+				real_len = 0;
 				new_line_pos = 0;
 			}
 			continue;
 		}
-		/* *d == NUL: old line ended, go to next old one */
+		/* linebuf[off] == NUL: old line ended, go to next old one */
 		free(MEMPTR(old_flines[src_idx]));
 		/* btw, convert cur_fline... */
 		if (cur_fline == src_idx)
@@ -386,6 +428,7 @@ static void re_wrap(void)
 		}
 	}
 
+	free(linebuf);
 	free(old_flines);
 	flines = (const char **)new_flines;
 
@@ -441,7 +484,8 @@ static int at_end(void)
  */
 static void read_lines(void)
 {
-	char *current_line, *p;
+	char *current_line = NULL;
+	int off = 0;
 	int w = width;
 	char last_terminated = terminated;
 	time_t last_time = 0;
@@ -449,6 +493,8 @@ static void read_lines(void)
 #if ENABLE_FEATURE_LESS_REGEXP
 	unsigned old_max_fline = max_fline;
 #endif
+	int real_size = w; /* size actually allocated to the line buffer */
+	int real_len; /* number of bytes actually used in the line buffer */
 
 #define readbuf bb_common_bufsiz1
 	setup_common_bufsiz();
@@ -460,10 +506,12 @@ static void read_lines(void)
 	if (option_mask32 & FLAG_N)
 		w -= 8;
 
-	p = current_line = ((char*)xmalloc(w + 5)) + 4;
+	current_line = ((char*)xmalloc(real_size + 5)) + 4;
+
 	if (!last_terminated) {
 		const char *cp = flines[max_fline];
-		p = stpcpy(p, cp);
+		stpcpy(current_line, cp);
+		off = strlen(cp);
 		free(MEMPTR(cp));
 		/* last_line_pos is still valid from previous read_lines() */
 	} else {
@@ -472,10 +520,19 @@ static void read_lines(void)
 	}
 
 	while (1) { /* read lines until we reach cur_fline or wanted_match */
-		*p = '\0';
+		current_line[off] = '\0';
 		terminated = 0;
+		real_len = 0;
+
 		while (1) { /* read chars until we have a line */
 			char c;
+#ifdef ENABLE_FEATURE_LESS_RAW
+			/* the buffer became too small, perhaps because of the escape sequences */
+			if (real_size == real_len) {
+				real_size += w;
+				current_line = (char*)xrealloc(MEMPTR(current_line), real_size + 1 + 4) + 4;
+			}
+#endif
 			/* if no unprocessed chars left, eat more */
 			if (readpos >= readeof) {
 				int flags = ndelay_on(0);
@@ -506,13 +563,20 @@ static void read_lines(void)
 			/* backspace? [needed for manpages] */
 			/* <tab><bs> is (a) insane and */
 			/* (b) harder to do correctly, so we refuse to do it */
-			if (c == '\x8' && last_line_pos && p[-1] != '\t') {
+			if (c == '\x8' && last_line_pos && current_line[off-1] != '\t') {
 				readpos++; /* eat it */
 				last_line_pos--;
 			/* was buggy (p could end up <= current_line)... */
-				*--p = '\0';
+				current_line[--off] = '\0';
 				continue;
 			}
+#ifdef ENABLE_FEATURE_LESS_RAW
+			/* if we're in a control sequence we don't advance the last_line_pos */
+			if (option_mask32 & FLAG_R && c == ESC[0]) {
+				in_escape = 1;
+			}
+			if (!in_escape)
+#endif
 			{
 				size_t new_last_line_pos = last_line_pos + 1;
 				if (c == '\t') {
@@ -530,10 +594,16 @@ static void read_lines(void)
 				last_line_pos = 0;
 				break;
 			}
+			real_len++;
+#ifdef ENABLE_FEATURE_LESS_RAW
+			if (in_escape && c != ESC[0] && !iscontrol(c)) {
+				in_escape = 0;
+			}
+#endif
 			/* NUL is substituted by '\n'! */
 			if (c == '\0') c = '\n';
-			*p++ = c;
-			*p = '\0';
+			current_line[off++] = c;
+			current_line[off] = '\0';
 		} /* end of "read chars until we have a line" loop */
 #if 0
 //BUG: also triggers on this:
@@ -552,7 +622,8 @@ static void read_lines(void)
 		last_terminated = terminated;
 		flines = xrealloc_vector(flines, 8, max_fline);
 
-		flines[max_fline] = (char*)xrealloc(MEMPTR(current_line), strlen(current_line) + 1 + 4) + 4;
+		real_size = real_len;
+		flines[max_fline] = (char*)xrealloc(MEMPTR(current_line), real_size + 1 + 4) + 4;
 		LINENO(flines[max_fline]) = max_lineno;
 		if (terminated)
 			max_lineno++;
@@ -578,7 +649,7 @@ static void read_lines(void)
 		}
 		max_fline++;
 		current_line = ((char*)xmalloc(w + 5)) + 4;
-		p = current_line;
+		off = 0;
 		last_line_pos = 0;
 	} /* end of "read lines until we reach cur_fline" loop */
 
@@ -759,23 +830,29 @@ static void print_found(const char *line)
 	char *growline;
 	regmatch_t match_structs;
 
-	char buf[width+1];
+	char *buf;
 	const char *str = line;
-	char *p = buf;
-	size_t n;
+	char *p;
 
-	while (*str) {
-		n = strcspn(str, controls);
-		if (n) {
-			if (!str[n]) break;
-			memcpy(p, str, n);
+	buf = xmalloc(strlen(str)+1);
+	p = buf;
+
+	if (!(option_mask32 & FLAG_R)) {
+		size_t n;
+
+		while (*str) {
+			n = strcspn(str, controls);
+			if (n) {
+				if (!str[n]) break;
+				memcpy(p, str, n);
+				p += n;
+				str += n;
+			}
+			n = strspn(str, controls);
+			memset(p, '.', n);
 			p += n;
 			str += n;
 		}
-		n = strspn(str, controls);
-		memset(p, '.', n);
-		p += n;
-		str += n;
 	}
 	strcpy(p, str);
 
@@ -811,6 +888,7 @@ static void print_found(const char *line)
 
 	printf("%s%s\n", growline ? growline : "", str);
 	free(growline);
+	free(buf);
 }
 #else
 void print_found(const char *line);
@@ -818,33 +896,39 @@ void print_found(const char *line);
 
 static void print_ascii(const char *str)
 {
-	char buf[width+1];
-	char *p;
-	size_t n;
+	if (!(option_mask32 & FLAG_R)) {
+	    char *buf;
+		char *p;
+		size_t n;
 
-	while (*str) {
-		n = strcspn(str, controls);
-		if (n) {
-			if (!str[n]) break;
-			printf("%.*s", (int) n, str);
-			str += n;
+		buf = xmalloc(strlen(str) + 1);
+		while (*str) {
+			n = strcspn(str, controls);
+			if (n) {
+				if (!str[n]) break;
+				printf("%.*s", (int) n, str);
+				str += n;
+			}
+			n = strspn(str, controls);
+			p = buf;
+			do {
+				if (*str == 0x7f)
+					*p++ = '?';
+				else if (*str == (char)0x9b)
+				/* VT100's CSI, aka Meta-ESC. Who's inventor? */
+				/* I want to know who committed this sin */
+					*p++ = '{';
+				else
+					*p++ = ctrlconv[(unsigned char)*str];
+				str++;
+			} while (--n);
+			*p = '\0';
+			print_hilite(buf);
 		}
-		n = strspn(str, controls);
-		p = buf;
-		do {
-			if (*str == 0x7f)
-				*p++ = '?';
-			else if (*str == (char)0x9b)
-			/* VT100's CSI, aka Meta-ESC. Who's inventor? */
-			/* I want to know who committed this sin */
-				*p++ = '{';
-			else
-				*p++ = ctrlconv[(unsigned char)*str];
-			str++;
-		} while (--n);
-		*p = '\0';
-		print_hilite(buf);
+
+		free(buf);
 	}
+
 	puts(str);
 }
 
@@ -1461,6 +1545,13 @@ static void flag_change(void)
 		buffer_fill_and_print();
 		break;
 #endif
+#if ENABLE_FEATURE_LESS_RAW
+	case 'R':
+		option_mask32 ^= FLAG_R;
+		re_wrap();
+		buffer_fill_and_print();
+		break;
+#endif
 	}
 }
 
@@ -1489,6 +1580,9 @@ static void show_flag_status(void)
 		break;
 	case 'E':
 		flag_val = option_mask32 & FLAG_E;
+		break;
+	case 'R':
+		flag_val = option_mask32 & FLAG_R;
 		break;
 	default:
 		flag_val = 0;
@@ -1771,7 +1865,7 @@ int less_main(int argc, char **argv)
 	 * -s: condense many empty lines to one
 	 *     (used by some setups for manpage display)
 	 */
-	getopt32(argv, "EMmN~I" IF_FEATURE_LESS_TRUNCATE("S") /*ignored:*/"s");
+	getopt32(argv, "EMmN~I" IF_FEATURE_LESS_TRUNCATE("S") IF_FEATURE_LESS_TRUNCATE("R") /*ignored:*/"s");
 	argv += optind;
 	num_files = argc - optind;
 	files = argv;
