@@ -107,6 +107,14 @@
 //config:	help
 //config:	This is essential for less applet to work with tools that use colors
 //config:	and paging, such as git, systemd tools or nmcli.
+//config:
+//config:config FEATURE_LESS_ENV
+//config:	bool "Take the options from an environment variable"
+//config:	default y
+//config:	depends on FEATURE_LESS_DASHCMD
+//config:	help
+//config:	This is essential for less applet to work with tools that use colors
+//config:	and paging, such as git, systemd tools or nmcli.
 
 //applet:IF_LESS(APPLET(less, BB_DIR_USR_BIN, BB_SUID_DROP))
 
@@ -1865,10 +1873,38 @@ int less_main(int argc, char **argv)
 	 * -s: condense many empty lines to one
 	 *     (used by some setups for manpage display)
 	 */
+
 	getopt32(argv, "EMmN~I" IF_FEATURE_LESS_TRUNCATE("S") IF_FEATURE_LESS_TRUNCATE("R") /*ignored:*/"s");
 	argv += optind;
 	num_files = argc - optind;
 	files = argv;
+
+#ifdef ENABLE_FEATURE_LESS_ENV
+	/* Tools typically pass LESS="FRSXMK".
+	 * The options we don't understand are ignored. */
+	{
+		char *c = getenv("LESS");
+
+		if (c) {
+			while (*c) {
+				switch (*c) {
+				case 'M':
+					option_mask32 |= FLAG_M;
+					break;
+				case 'R':
+					option_mask32 |= FLAG_R;
+					break;
+				case 'S':
+					option_mask32 |= FLAG_S;
+					break;
+				default:
+					break;
+				}
+				c++;
+			}
+		}
+	}
+#endif
 
 	/* Another popular pager, most, detects when stdout
 	 * is not a tty and turns into cat. This makes sense. */
